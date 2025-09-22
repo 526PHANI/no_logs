@@ -1,0 +1,81 @@
+{
+  "name": "no-logs-clean",
+  "displayName": "No Logs Clean",
+  "description": "Removes console logs and comments from your code - bulletproof regex approach",
+  "version": "1.0.0",
+  "publisher": "your-publisher",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "no-logs-clean.scanWorkspace",
+        "title": "Scan Workspace for Console Logs & Comments",
+        "category": "No Logs Clean"
+      },
+      {
+        "command": "no-logs-clean.cleanupWorkspace",
+        "title": "Remove All Console Logs & Comments",
+        "category": "No Logs Clean"
+      },
+      {
+        "command": "no-logs-clean.cleanupCurrentFile",
+        "title": "Clean Current File",
+        "category": "No Logs Clean"
+      }
+    ],
+    "configuration": {
+      "title": "No Logs Clean",
+      "properties": {
+        "no-logs-clean.includePatterns": {
+          "type": "array",
+          "default": [
+            "**/*.js",
+            "**/*.jsx",
+            "**/*.ts",
+            "**/*.tsx",
+            "**/*.vue",
+            "**/*.svelte"
+          ],
+          "description": "File patterns to include in cleanup"
+        },
+        "no-logs-clean.excludePatterns": {
+          "type": "array",
+          "default": [
+            "**/node_modules/**",
+            "**/dist/**",
+            "**/build/**",
+            "**/.git/**"
+          ],
+          "description": "File patterns to exclude from cleanup"
+        },
+        "no-logs-clean.removeComments": {
+          "type": "boolean",
+          "default": true,
+          "description": "Remove comments in addition to console logs"
+        },
+        "no-logs-clean.createBackups": {
+          "type": "boolean",
+          "default": true,
+          "description": "Create backups before cleanup"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.74.0",
+    "@types/node": "16.x",
+    "typescript": "^4.9.4"
+  }
+}
