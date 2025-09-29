@@ -1,81 +1,50 @@
 {
-  "name": "no-logs-clean",
-  "displayName": "No Logs Clean",
-  "description": "Removes console logs and comments from your code - bulletproof regex approach",
-  "version": "1.0.0",
-  "publisher": "your-publisher",
+  "name": "no-logs",
+  "displayName": "No-Logs",
+  "description": "Scan and remove console.log across your workspace with preview.",
+  "version": "0.0.1",
+  "publisher": "no-logs",
+  "license": "MIT",
   "engines": {
-    "vscode": "^1.74.0"
+    "vscode": "^1.88.0"
   },
   "categories": [
-    "Other"
+    "Linters"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onCommand:noLogs.scan",
+    "onCommand:noLogs.clean"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "no-logs-clean.scanWorkspace",
-        "title": "Scan Workspace for Console Logs & Comments",
-        "category": "No Logs Clean"
+        "command": "noLogs.scan",
+        "title": "No-Logs: Preview console.log occurrences"
       },
       {
-        "command": "no-logs-clean.cleanupWorkspace",
-        "title": "Remove All Console Logs & Comments",
-        "category": "No Logs Clean"
-      },
-      {
-        "command": "no-logs-clean.cleanupCurrentFile",
-        "title": "Clean Current File",
-        "category": "No Logs Clean"
+        "command": "noLogs.clean",
+        "title": "No-Logs: Remove console.log after review"
       }
-    ],
-    "configuration": {
-      "title": "No Logs Clean",
-      "properties": {
-        "no-logs-clean.includePatterns": {
-          "type": "array",
-          "default": [
-            "**/*.js",
-            "**/*.jsx",
-            "**/*.ts",
-            "**/*.tsx",
-            "**/*.vue",
-            "**/*.svelte"
-          ],
-          "description": "File patterns to include in cleanup"
-        },
-        "no-logs-clean.excludePatterns": {
-          "type": "array",
-          "default": [
-            "**/node_modules/**",
-            "**/dist/**",
-            "**/build/**",
-            "**/.git/**"
-          ],
-          "description": "File patterns to exclude from cleanup"
-        },
-        "no-logs-clean.removeComments": {
-          "type": "boolean",
-          "default": true,
-          "description": "Remove comments in addition to console logs"
-        },
-        "no-logs-clean.createBackups": {
-          "type": "boolean",
-          "default": true,
-          "description": "Create backups before cleanup"
-        }
-      }
-    }
+    ]
   },
   "scripts": {
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
-    "package": "vsce package"
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "package": "vsce package",
+    "test": "echo \"No tests\""
   },
   "devDependencies": {
-    "@types/vscode": "^1.74.0",
-    "@types/node": "16.x",
-    "typescript": "^4.9.4"
-  }
+  "@types/node": "^20.14.10",
+  "@types/vscode": "^1.88.0",
+  "typescript": "^5.6.3",
+  "vsce": "^2.15.0"
+  },
+  "dependencies": {
+    "@babel/parser": "^7.23.0",
+    "@babel/traverse": "^7.23.0",
+    "@babel/types": "^7.23.0"
+  
+}
 }
