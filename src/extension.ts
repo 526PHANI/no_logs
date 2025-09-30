@@ -1,16 +1,23 @@
- import * as vscode from "vscode";
+import * as vscode from "vscode";
 import { scanConsoleLogsInText } from "./scanner";
 import { TextOccurrence, FileLogOccurrences } from "./types";
 import { findWorkspaceScriptFiles, getRelativePath } from "./fileUtils";
 
 let lastScan: FileLogOccurrences[] = [];
 
+interface RemovalStrategy {
+  range: vscode.Range;
+  replacement?: string;
+  requiresConfirmation: boolean;
+  context: string;
+}
+
 export async function activate(context: vscode.ExtensionContext) {
   console.log("No-Logs extension is activating...");
 
   const scanCmd = vscode.commands.registerCommand("noLogs.scan", async () => {
     console.log("Scan command triggered");
-    await runScanAndMaybeClean(true); // preview only
+    await runScanAndMaybeClean(true);
   });
 
   const cleanCmd = vscode.commands.registerCommand("noLogs.clean", async () => {
@@ -177,14 +184,37 @@ async function confirmAndApplyRemoval(findings: FileLogOccurrences[]) {
   const total = findings.reduce((acc, f) => acc + f.occurrences.length, 0);
   const fileCount = findings.length;
 
+  let riskyCount = 0;
+  for (const file of findings) {
+    const uri = vscode.Uri.file(file.filePath);
+    try {
+      const doc = await vscode.workspace.openTextDocument(uri);
+      for (const occ of file.occurrences) {
+        const strategy = calculateSmartRemoval(doc, occ);
+        if (strategy?.requiresConfirmation) {
+          riskyCount++;
+        }
+      }
+    } catch (error) {
+      // Skip
+    }
+  }
+
+  let message = `No-Logs: Remove ${total} console statement${
+    total === 1 ? "" : "s"
+  } across ${fileCount} file${fileCount === 1 ? "" : "s"}?`;
+  
+  let detail = "This action cannot be undone. Make sure you have your files backed up or version controlled.";
+  
+  if (riskyCount > 0) {
+    detail += `\n\n⚠️ Warning: ${riskyCount} console statement${riskyCount === 1 ? '' : 's'} are in complex expressions and will be replaced with safe alternatives (undefined, {}, or null) to prevent syntax errors.`;
+  }
+
   const choice = await vscode.window.showWarningMessage(
-    `No-Logs: Remove ${total} console statement${
-      total === 1 ? "" : "s"
-    } across ${fileCount} file${fileCount === 1 ? "" : "s"}?`,
+    message,
     {
       modal: true,
-      detail:
-        "This action cannot be undone. Make sure you have your files backed up or version controlled.",
+      detail,
     },
     "Remove All",
     "Cancel"
@@ -197,6 +227,7 @@ async function confirmAndApplyRemoval(findings: FileLogOccurrences[]) {
 
   let successfulRemovals = 0;
   let failedRemovals = 0;
+  let replacements = 0;
   const errors: string[] = [];
 
   await vscode.window.withProgress(
@@ -216,9 +247,10 @@ async function confirmAndApplyRemoval(findings: FileLogOccurrences[]) {
         });
 
         try {
-          const success = await processFile(file);
-          if (success) {
-            successfulRemovals += file.occurrences.length;
+          const result = await processFile(file);
+          if (result.success) {
+            successfulRemovals += result.removed;
+            replacements += result.replaced;
           } else {
             failedRemovals += file.occurrences.length;
             errors.push(`Failed to process ${filename}`);
@@ -238,6 +270,9 @@ async function confirmAndApplyRemoval(findings: FileLogOccurrences[]) {
     let message = `No-Logs: Successfully removed ${successfulRemovals} console statement${
       successfulRemovals === 1 ? "" : "s"
     }`;
+    if (replacements > 0) {
+      message += ` (${replacements} replaced with safe alternatives)`;
+    }
     if (failedRemovals > 0) {
       message += `. ${failedRemovals} removal${
         failedRemovals === 1 ? "" : "s"
@@ -259,7 +294,11 @@ async function confirmAndApplyRemoval(findings: FileLogOccurrences[]) {
   }
 }
 
-async function processFile(file: FileLogOccurrences): Promise<boolean> {
+async function processFile(file: FileLogOccurrences): Promise<{
+  success: boolean;
+  removed: number;
+  replaced: number;
+}> {
   const uri = vscode.Uri.file(file.filePath);
 
   try {
@@ -270,10 +309,19 @@ async function processFile(file: FileLogOccurrences): Promise<boolean> {
       (a, b) => b.startIndex - a.startIndex
     );
 
+    let removed = 0;
+    let replaced = 0;
+
     for (const occ of sorted) {
-      const removal = calculateSmartRemoval(doc, occ);
-      if (removal) {
-        edit.delete(uri, removal);
+      const strategy = calculateSmartRemoval(doc, occ);
+      if (strategy) {
+        if (strategy.replacement !== undefined) {
+          edit.replace(uri, strategy.range, strategy.replacement);
+          replaced++;
+        } else {
+          edit.delete(uri, strategy.range);
+          removed++;
+        }
       }
     }
 
@@ -281,41 +329,224 @@ async function processFile(file: FileLogOccurrences): Promise<boolean> {
     if (success) {
       await doc.save();
     }
-    return success;
+    return { success, removed, replaced };
   } catch (error) {
     console.error(
       `Error processing ${file.filePath}: ${(error as Error).message}`
     );
-    return false;
+    return { success: false, removed: 0, replaced: 0 };
   }
 }
 
 function calculateSmartRemoval(
   doc: vscode.TextDocument,
   occ: TextOccurrence
-): vscode.Range | null {
+): RemovalStrategy | null {
   const start = doc.positionAt(occ.startIndex);
   const end = doc.positionAt(occ.endIndex);
   const line = doc.lineAt(start.line);
 
   const before = line.text.slice(0, start.character);
   const after = line.text.slice(end.character);
+  const trimmedBefore = before.trim();
+  const trimmedAfter = after.trim();
 
-  // Case 1: whole line only console.log
+  // Get extended context for better detection
+  const extendedBefore = getExtendedContext(doc, start, 100, 'before');
+  const extendedAfter = getExtendedContext(doc, end, 50, 'after');
+
+  // PATTERN 1: Arrow function without braces: => console.log(...)
+  // Must check there's no { after =>
+  if (/=>\s*$/.test(trimmedBefore) && !/^\s*\{/.test(after)) {
+    // Preserve semicolon or comma if present
+    const trailingPunctMatch = trimmedAfter.match(/^([;,])/);
+    const trailing = trailingPunctMatch ? trailingPunctMatch[1] : '';
+    return {
+      range: new vscode.Range(start, end),
+      replacement: `{}${trailing}`,
+      requiresConfirmation: true,
+      context: "Arrow function body",
+    };
+  }
+
+  // PATTERN 2: Ternary consequent: ? console.log(...)
+  if (/\?\s*$/.test(trimmedBefore)) {
+    return {
+      range: new vscode.Range(start, end),
+      replacement: "undefined",
+      requiresConfirmation: true,
+      context: "Ternary consequent",
+    };
+  }
+
+  // PATTERN 3: Ternary alternate: : console.log(...)
+  // Check it's actually a ternary, not object property
+  if (/:\s*$/.test(trimmedBefore)) {
+    // Look back for ? to confirm it's a ternary
+    const hasQuestionMark = extendedBefore.includes('?');
+    // Check it's not an object literal by looking for opening brace
+    const lastBraceIndex = extendedBefore.lastIndexOf('{');
+    const lastQuestionIndex = extendedBefore.lastIndexOf('?');
+    
+    if (hasQuestionMark && (lastBraceIndex === -1 || lastQuestionIndex > lastBraceIndex)) {
+      return {
+        range: new vscode.Range(start, end),
+        replacement: "undefined",
+        requiresConfirmation: true,
+        context: "Ternary alternate",
+      };
+    }
+  }
+
+  // PATTERN 4: Return statement: return console.log(...)
+  if (/\breturn\s+$/.test(before)) {
+    // Check if there's more after (like || or &&)
+    if (/^\s*(\|\||&&)/.test(after)) {
+      return {
+        range: new vscode.Range(start, end),
+        replacement: "undefined",
+        requiresConfirmation: true,
+        context: "Return with logical operator",
+      };
+    }
+    return {
+      range: new vscode.Range(start, end),
+      replacement: "undefined",
+      requiresConfirmation: true,
+      context: "Return statement",
+    };
+  }
+
+  // PATTERN 5: Logical OR: || console.log(...)
+  if (/\|\|\s*$/.test(trimmedBefore)) {
+    return {
+      range: new vscode.Range(start, end),
+      replacement: "undefined",
+      requiresConfirmation: true,
+      context: "Logical OR",
+    };
+  }
+
+  // PATTERN 6: Logical AND: && console.log(...)
+  if (/&&\s*$/.test(trimmedBefore)) {
+    return {
+      range: new vscode.Range(start, end),
+      replacement: "undefined",
+      requiresConfirmation: true,
+      context: "Logical AND",
+    };
+  }
+
+  // PATTERN 7: Comma operator - first position: (console.log(...), something)
+  if (/\(\s*$/.test(trimmedBefore) && /^\s*,/.test(trimmedAfter)) {
+    // Remove console.log and the trailing comma
+    const commaMatch = after.match(/^\s*,\s*/);
+    if (commaMatch) {
+      const endPos = doc.positionAt(occ.endIndex + commaMatch[0].length);
+      return {
+        range: new vscode.Range(start, endPos),
+        replacement: "",
+        requiresConfirmation: true,
+        context: "Comma operator (first)",
+      };
+    }
+  }
+
+  // PATTERN 8: Comma operator - last position: (something, console.log(...))
+  if (/,\s*$/.test(trimmedBefore) && /^\s*\)/.test(trimmedAfter)) {
+    // Remove the preceding comma and console.log
+    const commaMatch = before.match(/,\s*$/);
+    if (commaMatch) {
+      const startPos = new vscode.Position(
+        start.line,
+        start.character - commaMatch[0].length
+      );
+      return {
+        range: new vscode.Range(startPos, end),
+        replacement: "",
+        requiresConfirmation: true,
+        context: "Comma operator (last)",
+      };
+    }
+  }
+
+  // PATTERN 9: JSX expression: {console.log(...)}
+  if (/\{\s*$/.test(trimmedBefore) && /^\s*\}/.test(trimmedAfter)) {
+    return {
+      range: new vscode.Range(start, end),
+      replacement: "null",
+      requiresConfirmation: true,
+      context: "JSX expression",
+    };
+  }
+
+  // PATTERN 10: Function call argument: func(console.log(...))
+  if (/\w+\s*\(\s*$/.test(trimmedBefore) && /^\s*\)/.test(trimmedAfter)) {
+    return {
+      range: new vscode.Range(start, end),
+      replacement: "() => {}",
+      requiresConfirmation: true,
+      context: "Function argument",
+    };
+  }
+
+  // Safe removal cases - original logic
+
+  // Case 1: Whole line only console.log
   if (/^\s*$/.test(before) && /^\s*$/.test(after)) {
-    return line.rangeIncludingLineBreak;
+    return {
+      range: line.rangeIncludingLineBreak,
+      replacement: undefined,
+      requiresConfirmation: false,
+      context: "Standalone statement",
+    };
   }
 
-  // Case 2: console at start of line
+  // Case 2: Console at start of line with optional semicolon
   if (/^\s*$/.test(before)) {
-    return new vscode.Range(line.range.start, end);
+    return {
+      range: new vscode.Range(line.range.start, end),
+      replacement: undefined,
+      requiresConfirmation: false,
+      context: "Start of line",
+    };
   }
 
-  // Case 3: console at end of line
-  if (/^\s*$/.test(after)) {
-    return new vscode.Range(start, line.rangeIncludingLineBreak.end);
+  // Case 3: Console at end of line
+  if (/^\s*;?\s*$/.test(after)) {
+    return {
+      range: new vscode.Range(start, line.rangeIncludingLineBreak.end),
+      replacement: undefined,
+      requiresConfirmation: false,
+      context: "End of line",
+    };
   }
 
   // Default: just remove the statement
-  return new vscode.Range(start, end);
+  return {
+    range: new vscode.Range(start, end),
+    replacement: undefined,
+    requiresConfirmation: false,
+    context: "Default removal",
+  };
+}
+
+function getExtendedContext(
+  doc: vscode.TextDocument,
+  pos: vscode.Position,
+  charCount: number,
+  direction: 'before' | 'after'
+): string {
+  if (direction === 'before') {
+    const startOffset = Math.max(0, doc.offsetAt(pos) - charCount);
+    const startPos = doc.positionAt(startOffset);
+    return doc.getText(new vscode.Range(startPos, pos));
+  } else {
+    const endOffset = Math.min(
+      doc.getText().length,
+      doc.offsetAt(pos) + charCount
+    );
+    const endPos = doc.positionAt(endOffset);
+    return doc.getText(new vscode.Range(pos, endPos));
+  }
 }
