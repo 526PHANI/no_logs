@@ -1,55 +1,148 @@
 {
   "name": "no-logs",
-  "displayName": "No-Logs",
-  "description": "Scan and remove console.log across your workspace with preview.",
-  "version": "0.0.1",
-  "publisher": "no-logs",
-  "license": "MIT",
+  "displayName": "No-Logs - Console Cleaner",
+  "description": "Automatically remove console statements with rollback support and detailed reports",
+  "version": "2.0.0",
+  "publisher": "your-publisher-name",
   "engines": {
-    "vscode": "^1.88.0"
-  },
-    "repository": {
-    "type": "git",
-    "url": "https://github.com/526PHANI/no_logs.git"
+    "vscode": "^1.80.0"
   },
   "categories": [
+    "Other",
+    "Formatters",
     "Linters"
   ],
+  "keywords": [
+    "console",
+    "log",
+    "remove",
+    "clean",
+    "debug",
+    "javascript",
+    "typescript"
+  ],
   "activationEvents": [
-    "onCommand:noLogs.scan",
-    "onCommand:noLogs.clean"
+    "onCommand:noLogs.clean",
+    "onCommand:noLogs.preview",
+    "onCommand:noLogs.rollback"
   ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "noLogs.scan",
-        "title": "No-Logs: Preview console.log occurrences"
+        "command": "noLogs.clean",
+        "title": "No Logs: Clean Console Statements",
+        "icon": "$(trash)"
       },
       {
-        "command": "noLogs.clean",
-        "title": "No-Logs: Remove console.log after review"
+        "command": "noLogs.preview",
+        "title": "No Logs: Preview Console Statements",
+        "icon": "$(search)"
+      },
+      {
+        "command": "noLogs.rollback",
+        "title": "No Logs: Rollback Last Cleanup",
+        "icon": "$(discard)"
       }
-    ]
+    ],
+    "keybindings": [
+      {
+        "command": "noLogs.clean",
+        "key": "ctrl+shift+l",
+        "mac": "cmd+shift+l"
+      },
+      {
+        "command": "noLogs.preview",
+        "key": "ctrl+shift+alt+l",
+        "mac": "cmd+shift+alt+l"
+      },
+      {
+        "command": "noLogs.rollback",
+        "key": "ctrl+alt+shift+z",
+        "mac": "cmd+alt+shift+z"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "noLogs.clean",
+          "group": "1_modification",
+          "when": "editorLangId =~ /javascript|typescript|javascriptreact|typescriptreact|vue|svelte/"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "noLogs.clean"
+        },
+        {
+          "command": "noLogs.preview"
+        },
+        {
+          "command": "noLogs.rollback"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "No Logs",
+      "properties": {
+        "noLogs.excludePatterns": {
+          "type": "array",
+          "default": [
+            "**/node_modules/**",
+            "**/dist/**",
+            "**/build/**",
+            "**/out/**",
+            "**/.output/**",
+            "**/coverage/**",
+            "**/*.min.js",
+            "**/*.bundle.js"
+          ],
+          "description": "Additional glob patterns to exclude from scanning"
+        },
+        "noLogs.autoGenerateReport": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically generate .no-logs-report.md after cleanup"
+        },
+        "noLogs.createBackup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Create backup before removing console statements (required for rollback)"
+        },
+        "noLogs.consoleMethodsToRemove": {
+          "type": "array",
+          "default": [
+            "log",
+            "error",
+            "warn",
+            "info",
+            "debug",
+            "trace",
+            "dir",
+            "table",
+            "group",
+            "groupEnd",
+            "groupCollapsed"
+          ],
+          "description": "Console methods to remove (remove items from this list to keep them)"
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p .",
-    "watch": "tsc -w -p .",
-    "package": "vsce package",
-    "test": "echo \"No tests\""
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js"
   },
   "devDependencies": {
-    "@types/node": "^20.14.10",
-    "@types/vscode": "^1.88.0",
-    "typescript": "^5.6.3",
-    "vsce": "^2.15.0"
-  },
-  "dependencies": {
-    "@babel/parser": "^7.23.0",
-    "@babel/traverse": "^7.23.0",
-    "@babel/types": "^7.23.0",
-    "acorn": "^8.15.0",
-    "acorn-typescript": "^1.4.13"
+    "@types/vscode": "^1.80.0",
+    "@types/node": "16.x",
+    "@typescript-eslint/eslint-plugin": "^5.59.0",
+    "@typescript-eslint/parser": "^5.59.0",
+    "eslint": "^8.41.0",
+    "typescript": "^5.0.4"
   }
-}
+}  

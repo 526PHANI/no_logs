@@ -1,9 +1,11 @@
 import * as vscode from "vscode";
+import * as fs from "fs";
+import * as path from "path";
 import { scanConsoleLogsInText } from "./scanner";
-import { TextOccurrence, FileLogOccurrences } from "./types";
+import { TextOccurrence, FileLogOccurrences, BackupData } from "./types";
 import { findWorkspaceScriptFiles, getRelativePath } from "./fileUtils";
 
-let lastScan: FileLogOccurrences[] = [];
+let lastBackup: BackupData | null = null;
 
 interface RemovalStrategy {
   range: vscode.Range;
@@ -12,25 +14,40 @@ interface RemovalStrategy {
   context: string;
 }
 
+interface RemovalResult {
+  filePath: string;
+  relativePath: string;
+  removals: Array<{
+    line: number;
+    originalCode: string;
+    action: "removed" | "replaced";
+    replacement?: string;
+    context: string;
+  }>;
+}
+
 export async function activate(context: vscode.ExtensionContext) {
   console.log("No-Logs extension is activating...");
 
-  const scanCmd = vscode.commands.registerCommand("noLogs.scan", async () => {
-    console.log("Scan command triggered");
-    await runScanAndMaybeClean(true);
-  });
-
+  // Main cleanup command (simplified workflow)
   const cleanCmd = vscode.commands.registerCommand("noLogs.clean", async () => {
     console.log("Clean command triggered");
-    if (lastScan.length === 0) {
-      console.log("No previous scan results, running scan first");
-      await runScanAndMaybeClean(false);
-      return;
-    }
-    await confirmAndApplyRemoval(lastScan);
+    await runCleanupWorkflow();
   });
 
-  context.subscriptions.push(scanCmd, cleanCmd);
+  // Rollback command
+  const rollbackCmd = vscode.commands.registerCommand("noLogs.rollback", async () => {
+    console.log("Rollback command triggered");
+    await performRollback();
+  });
+
+  // Preview only command
+  const previewCmd = vscode.commands.registerCommand("noLogs.preview", async () => {
+    console.log("Preview command triggered");
+    await runPreviewOnly();
+  });
+
+  context.subscriptions.push(cleanCmd, rollbackCmd, previewCmd);
   console.log("No-Logs extension activated successfully");
 }
 
@@ -38,8 +55,8 @@ export function deactivate() {
   console.log("No-Logs extension deactivated");
 }
 
-async function runScanAndMaybeClean(withPreview: boolean) {
-  console.log("Starting scan process...");
+async function runCleanupWorkflow() {
+  console.log("Starting cleanup workflow...");
 
   try {
     const workspaceFolders = vscode.workspace.workspaceFolders;
@@ -50,140 +67,119 @@ async function runScanAndMaybeClean(withPreview: boolean) {
       return;
     }
 
-    const files = await findWorkspaceScriptFiles();
-    console.log(`Found ${files.length} files to scan`);
-
-    if (files.length === 0) {
-      vscode.window.showInformationMessage(
-        "No-Logs: No JavaScript/TypeScript files found in the workspace."
-      );
+    // Step 1: Scan files
+    const findings = await scanWorkspace();
+    if (!findings || findings.length === 0) {
       return;
     }
 
-    const findings: FileLogOccurrences[] = [];
-    let total = 0;
-    let processedFiles = 0;
-    let skippedFiles = 0;
-    let errors: string[] = [];
+    // Step 2: Show preview with quick pick
+    const shouldProceed = await showPreviewAndConfirm(findings);
+    if (!shouldProceed) {
+      vscode.window.showInformationMessage("No-Logs: Cleanup cancelled.");
+      return;
+    }
 
-    await vscode.window.withProgress(
-      {
-        location: vscode.ProgressLocation.Notification,
-        title: "Scanning for console statements...",
-        cancellable: false,
-      },
-      async (progress) => {
-        for (let i = 0; i < files.length; i++) {
-          const uri = files[i];
-          const filename = getRelativePath(uri);
+    // Step 3: Perform cleanup with backup
+    await performCleanup(findings);
+  } catch (error) {
+    console.error("Error in runCleanupWorkflow:", error);
+    vscode.window.showErrorMessage(
+      `No-Logs: Error during cleanup: ${(error as Error).message}`
+    );
+  }
+}
 
-          progress.report({
-            increment: (1 / files.length) * 100,
-            message: `Scanning ${filename}... (${i + 1}/${files.length})`,
-          });
+async function runPreviewOnly() {
+  try {
+    const findings = await scanWorkspace();
+    if (!findings || findings.length === 0) {
+      return;
+    }
+    await showDetailedPreview(findings);
+  } catch (error) {
+    console.error("Error in runPreviewOnly:", error);
+    vscode.window.showErrorMessage(
+      `No-Logs: Error during preview: ${(error as Error).message}`
+    );
+  }
+}
 
-          if (uri.fsPath.includes(".output")) {
+async function scanWorkspace(): Promise<FileLogOccurrences[] | null> {
+  const files = await findWorkspaceScriptFiles();
+  console.log(`Found ${files.length} files to scan`);
+
+  if (files.length === 0) {
+    vscode.window.showInformationMessage(
+      "No-Logs: No JavaScript/TypeScript files found in the workspace."
+    );
+    return null;
+  }
+
+  const findings: FileLogOccurrences[] = [];
+  let total = 0;
+  let processedFiles = 0;
+  let skippedFiles = 0;
+
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "Scanning for console statements...",
+      cancellable: false,
+    },
+    async (progress) => {
+      for (let i = 0; i < files.length; i++) {
+        const uri = files[i];
+        const filename = getRelativePath(uri);
+
+        progress.report({
+          increment: (1 / files.length) * 100,
+          message: `${i + 1}/${files.length}: ${filename}`,
+        });
+
+        try {
+          const doc = await vscode.workspace.openTextDocument(uri);
+          const text = doc.getText();
+
+          if (text.length > 5_000_000) {
             skippedFiles++;
             continue;
           }
 
-          try {
-            const doc = await vscode.workspace.openTextDocument(uri);
-            const text = doc.getText();
-
-            if (text.length > 5_000_000) {
-              skippedFiles++;
-              continue;
-            }
-
-            const occurrences = scanConsoleLogsInText(text);
-            if (occurrences.length > 0) {
-              findings.push({
-                filePath: uri.fsPath,
-                occurrences,
-              });
-              total += occurrences.length;
-            }
-
-            processedFiles++;
-          } catch (error) {
-            const errorMsg = `Error scanning ${filename}: ${error}`;
-            console.error(errorMsg);
-            errors.push(errorMsg);
-            skippedFiles++;
+          const occurrences = scanConsoleLogsInText(text);
+          if (occurrences.length > 0) {
+            findings.push({
+              filePath: uri.fsPath,
+              occurrences,
+            });
+            total += occurrences.length;
           }
+
+          processedFiles++;
+        } catch (error) {
+          console.error(`Error scanning ${filename}:`, error);
+          skippedFiles++;
         }
       }
-    );
-
-    lastScan = findings;
-
-    if (total === 0) {
-      let message = `No-Logs: No console statements found (scanned ${processedFiles} files`;
-      if (skippedFiles > 0) message += `, skipped ${skippedFiles}`;
-      if (errors.length > 0) message += `, ${errors.length} errors`;
-      message += `)`;
-      vscode.window.showInformationMessage(message);
-      return;
     }
+  );
 
-    if (withPreview) {
-      await showPreview(findings);
-    } else {
-      await confirmAndApplyRemoval(findings);
-    }
-  } catch (error) {
-    console.error("Error in runScanAndMaybeClean:", error);
-    vscode.window.showErrorMessage(
-      `No-Logs: Error during scan: ${(error as Error).message}`
-    );
+  if (total === 0) {
+    let message = `No-Logs: ✨ No console statements found! (scanned ${processedFiles} files`;
+    if (skippedFiles > 0) message += `, skipped ${skippedFiles}`;
+    message += `)`;
+    vscode.window.showInformationMessage(message);
+    return null;
   }
+
+  return findings;
 }
 
-async function showPreview(findings: FileLogOccurrences[]) {
-  const items: vscode.QuickPickItem[] = [];
-
-  for (const file of findings) {
-    const rel = getRelativePath(vscode.Uri.file(file.filePath));
-    for (const occ of file.occurrences) {
-      items.push({
-        label: `${rel}:${occ.startLine + 1}`,
-        description: occ.preview,
-        detail: `console.${occ.method}(...)`,
-      });
-    }
-  }
-
-  const selected = await vscode.window.showQuickPick(items, {
-    canPickMany: false,
-    title: `No-Logs: Found ${items.length} console statements across ${findings.length} files`,
-    placeHolder:
-      "Select an item to open in the editor (this is just a preview, nothing will be deleted)",
-  });
-
-  if (selected) {
-    const [filePath, lineStr] = selected.label.split(":");
-    const line = parseInt(lineStr, 10) - 1;
-    const file = findings.find((f) =>
-      getRelativePath(vscode.Uri.file(f.filePath)).endsWith(filePath)
-    );
-    if (file) {
-      const doc = await vscode.workspace.openTextDocument(file.filePath);
-      const editor = await vscode.window.showTextDocument(doc);
-      const pos = new vscode.Position(line, 0);
-      editor.selection = new vscode.Selection(pos, pos);
-      editor.revealRange(
-        new vscode.Range(pos, pos),
-        vscode.TextEditorRevealType.InCenter
-      );
-    }
-  }
-}
-
-async function confirmAndApplyRemoval(findings: FileLogOccurrences[]) {
+async function showPreviewAndConfirm(findings: FileLogOccurrences[]): Promise<boolean> {
   const total = findings.reduce((acc, f) => acc + f.occurrences.length, 0);
   const fileCount = findings.length;
 
+  // Calculate risky removals
   let riskyCount = 0;
   for (const file of findings) {
     const uri = vscode.Uri.file(file.filePath);
@@ -200,14 +196,12 @@ async function confirmAndApplyRemoval(findings: FileLogOccurrences[]) {
     }
   }
 
-  let message = `No-Logs: Remove ${total} console statement${
-    total === 1 ? "" : "s"
-  } across ${fileCount} file${fileCount === 1 ? "" : "s"}?`;
-  
-  let detail = "This action cannot be undone. Make sure you have your files backed up or version controlled.";
-  
+  let message = `Found ${total} console statement${total === 1 ? "" : "s"} across ${fileCount} file${fileCount === 1 ? "" : "s"}`;
+  let detail = "A backup will be created automatically. You can rollback anytime using 'No Logs: Rollback Last Cleanup'.\n\n";
+  detail += "A detailed report will be saved to '.no-logs-report.md' in your workspace.";
+
   if (riskyCount > 0) {
-    detail += `\n\n⚠️ Warning: ${riskyCount} console statement${riskyCount === 1 ? '' : 's'} are in complex expressions and will be replaced with safe alternatives (undefined, {}, or null) to prevent syntax errors.`;
+    detail += `\n\n⚠️ Warning: ${riskyCount} statement${riskyCount === 1 ? '' : 's'} in complex expressions will be replaced with safe alternatives.`;
   }
 
   const choice = await vscode.window.showWarningMessage(
@@ -217,18 +211,75 @@ async function confirmAndApplyRemoval(findings: FileLogOccurrences[]) {
       detail,
     },
     "Remove All",
+    "Show Details",
     "Cancel"
   );
 
-  if (choice !== "Remove All") {
-    vscode.window.showInformationMessage("No-Logs: Removal cancelled.");
+  if (choice === "Show Details") {
+    await showDetailedPreview(findings);
+    // Ask again after showing details
+    return await showPreviewAndConfirm(findings);
+  }
+
+  return choice === "Remove All";
+}
+
+async function showDetailedPreview(findings: FileLogOccurrences[]) {
+  const items: vscode.QuickPickItem[] = [];
+
+  for (const file of findings) {
+    const rel = getRelativePath(vscode.Uri.file(file.filePath));
+    for (const occ of file.occurrences) {
+      items.push({
+        label: `📍 ${rel}:${occ.startLine + 1}`,
+        description: occ.preview,
+        detail: `console.${occ.method}(...)`,
+      });
+    }
+  }
+
+  const selected = await vscode.window.showQuickPick(items, {
+    canPickMany: false,
+    title: `${items.length} console statements found`,
+    placeHolder: "Select to jump to location (preview only)",
+  });
+
+  if (selected) {
+    const match = selected.label.match(/📍 (.+):(\d+)/);
+    if (match) {
+      const [, filePath, lineStr] = match;
+      const line = parseInt(lineStr, 10) - 1;
+      const file = findings.find((f) =>
+        getRelativePath(vscode.Uri.file(f.filePath)).includes(filePath)
+      );
+      if (file) {
+        const doc = await vscode.workspace.openTextDocument(file.filePath);
+        const editor = await vscode.window.showTextDocument(doc);
+        const pos = new vscode.Position(line, 0);
+        editor.selection = new vscode.Selection(pos, pos);
+        editor.revealRange(
+          new vscode.Range(pos, pos),
+          vscode.TextEditorRevealType.InCenter
+        );
+      }
+    }
+  }
+}
+
+async function performCleanup(findings: FileLogOccurrences[]) {
+  // Create backup first
+  const backup = await createBackup(findings);
+  if (!backup) {
+    vscode.window.showErrorMessage("No-Logs: Failed to create backup. Cleanup cancelled.");
     return;
   }
 
-  let successfulRemovals = 0;
-  let failedRemovals = 0;
-  let replacements = 0;
-  const errors: string[] = [];
+  lastBackup = backup;
+
+  let successCount = 0;
+  let failCount = 0;
+  let replacementCount = 0;
+  const removalResults: RemovalResult[] = [];
 
   await vscode.window.withProgress(
     {
@@ -237,67 +288,168 @@ async function confirmAndApplyRemoval(findings: FileLogOccurrences[]) {
       cancellable: false,
     },
     async (progress) => {
-      for (let fileIndex = 0; fileIndex < findings.length; fileIndex++) {
-        const file = findings[fileIndex];
+      for (let i = 0; i < findings.length; i++) {
+        const file = findings[i];
         const filename = getRelativePath(vscode.Uri.file(file.filePath));
 
         progress.report({
           increment: (1 / findings.length) * 100,
-          message: `Processing ${filename}... (${fileIndex + 1}/${findings.length})`,
+          message: `${i + 1}/${findings.length}: ${filename}`,
         });
 
         try {
-          const result = await processFile(file);
+          const result = await processFileWithDetails(file);
           if (result.success) {
-            successfulRemovals += result.removed;
-            replacements += result.replaced;
+            successCount += result.removed;
+            replacementCount += result.replaced;
+            if (result.details) {
+              removalResults.push(result.details);
+            }
           } else {
-            failedRemovals += file.occurrences.length;
-            errors.push(`Failed to process ${filename}`);
+            failCount += file.occurrences.length;
           }
         } catch (error) {
-          failedRemovals += file.occurrences.length;
-          const errorMsg = `Error processing ${filename}: ${
-            (error as Error).message
-          }`;
-          errors.push(errorMsg);
+          failCount += file.occurrences.length;
+          console.error(`Error processing ${filename}:`, error);
         }
       }
     }
   );
 
-  if (successfulRemovals > 0) {
-    let message = `No-Logs: Successfully removed ${successfulRemovals} console statement${
-      successfulRemovals === 1 ? "" : "s"
-    }`;
-    if (replacements > 0) {
-      message += ` (${replacements} replaced with safe alternatives)`;
+  // Generate report
+  await generateReport(removalResults, successCount, replacementCount, failCount);
+
+  // Show result
+  if (successCount > 0) {
+    let message = `✅ Successfully removed ${successCount} console statement${successCount === 1 ? "" : "s"}`;
+    if (replacementCount > 0) {
+      message += ` (${replacementCount} replaced)`;
     }
-    if (failedRemovals > 0) {
-      message += `. ${failedRemovals} removal${
-        failedRemovals === 1 ? "" : "s"
-      } failed`;
+    if (failCount > 0) {
+      message += `. ⚠️ ${failCount} failed`;
     }
     vscode.window.showInformationMessage(message);
-    if (errors.length > 0) {
-      vscode.window.showErrorMessage(
-        `Some errors occurred:\n${errors.join("\n")}`
-      );
-    }
-    lastScan = [];
-  } else if (failedRemovals > 0) {
-    vscode.window.showErrorMessage(
-      `No-Logs: All ${failedRemovals} removal attempts failed.`
+    
+    // Offer to open report
+    const openReport = await vscode.window.showInformationMessage(
+      "Report saved to .no-logs-report.md",
+      "Open Report"
     );
+    if (openReport === "Open Report") {
+      await openReportFile();
+    }
   } else {
-    vscode.window.showWarningMessage("No-Logs: No console statements removed.");
+    vscode.window.showWarningMessage("No-Logs: No console statements were removed.");
   }
 }
 
-async function processFile(file: FileLogOccurrences): Promise<{
+async function createBackup(findings: FileLogOccurrences[]): Promise<BackupData | null> {
+  try {
+    const backupData: BackupData = {
+      timestamp: new Date().toISOString(),
+      files: []
+    };
+
+    for (const file of findings) {
+      const uri = vscode.Uri.file(file.filePath);
+      const doc = await vscode.workspace.openTextDocument(uri);
+      backupData.files.push({
+        filePath: file.filePath,
+        originalContent: doc.getText()
+      });
+    }
+
+    console.log(`Backup created for ${backupData.files.length} files`);
+    return backupData;
+  } catch (error) {
+    console.error("Error creating backup:", error);
+    return null;
+  }
+}
+
+async function performRollback() {
+  if (!lastBackup) {
+    vscode.window.showWarningMessage(
+      "No-Logs: No backup found. Nothing to rollback."
+    );
+    return;
+  }
+
+  const choice = await vscode.window.showWarningMessage(
+    `Rollback to state from ${new Date(lastBackup.timestamp).toLocaleString()}?`,
+    {
+      modal: true,
+      detail: `This will restore ${lastBackup.files.length} file${lastBackup.files.length === 1 ? '' : 's'} to their previous state.`
+    },
+    "Rollback",
+    "Cancel"
+  );
+
+  if (choice !== "Rollback") {
+    return;
+  }
+
+  let restoredCount = 0;
+  let failedCount = 0;
+
+  await vscode.window.withProgress(
+    {
+      location: vscode.ProgressLocation.Notification,
+      title: "Rolling back changes...",
+      cancellable: false,
+    },
+    async (progress) => {
+      for (let i = 0; i < lastBackup!.files.length; i++) {
+        const backup = lastBackup!.files[i];
+        const filename = getRelativePath(vscode.Uri.file(backup.filePath));
+
+        progress.report({
+          increment: (1 / lastBackup!.files.length) * 100,
+          message: `${i + 1}/${lastBackup!.files.length}: ${filename}`,
+        });
+
+        try {
+          const uri = vscode.Uri.file(backup.filePath);
+          const doc = await vscode.workspace.openTextDocument(uri);
+          const edit = new vscode.WorkspaceEdit();
+          
+          const fullRange = new vscode.Range(
+            doc.positionAt(0),
+            doc.positionAt(doc.getText().length)
+          );
+          
+          edit.replace(uri, fullRange, backup.originalContent);
+          
+          const success = await vscode.workspace.applyEdit(edit);
+          if (success) {
+            await doc.save();
+            restoredCount++;
+          } else {
+            failedCount++;
+          }
+        } catch (error) {
+          console.error(`Error restoring ${filename}:`, error);
+          failedCount++;
+        }
+      }
+    }
+  );
+
+  if (restoredCount > 0) {
+    vscode.window.showInformationMessage(
+      `✅ Rollback complete! Restored ${restoredCount} file${restoredCount === 1 ? '' : 's'}.`
+    );
+    lastBackup = null;
+  } else {
+    vscode.window.showErrorMessage("No-Logs: Rollback failed.");
+  }
+}
+
+async function processFileWithDetails(file: FileLogOccurrences): Promise<{
   success: boolean;
   removed: number;
   replaced: number;
+  details: RemovalResult | null;
 }> {
   const uri = vscode.Uri.file(file.filePath);
 
@@ -311,16 +463,37 @@ async function processFile(file: FileLogOccurrences): Promise<{
 
     let removed = 0;
     let replaced = 0;
+    const removalDetails: RemovalResult = {
+      filePath: file.filePath,
+      relativePath: getRelativePath(uri),
+      removals: []
+    };
 
     for (const occ of sorted) {
       const strategy = calculateSmartRemoval(doc, occ);
       if (strategy) {
+        const line = doc.positionAt(occ.startIndex).line;
+        const originalLine = doc.lineAt(line).text.trim();
+
         if (strategy.replacement !== undefined) {
           edit.replace(uri, strategy.range, strategy.replacement);
           replaced++;
+          removalDetails.removals.push({
+            line: line + 1,
+            originalCode: originalLine,
+            action: "replaced",
+            replacement: strategy.replacement,
+            context: strategy.context
+          });
         } else {
           edit.delete(uri, strategy.range);
           removed++;
+          removalDetails.removals.push({
+            line: line + 1,
+            originalCode: originalLine,
+            action: "removed",
+            context: strategy.context
+          });
         }
       }
     }
@@ -329,12 +502,75 @@ async function processFile(file: FileLogOccurrences): Promise<{
     if (success) {
       await doc.save();
     }
-    return { success, removed, replaced };
+    return { success, removed, replaced, details: removalDetails };
   } catch (error) {
-    console.error(
-      `Error processing ${file.filePath}: ${(error as Error).message}`
-    );
-    return { success: false, removed: 0, replaced: 0 };
+    console.error(`Error processing ${file.filePath}:`, error);
+    return { success: false, removed: 0, replaced: 0, details: null };
+  }
+}
+
+async function generateReport(
+  results: RemovalResult[],
+  totalRemoved: number,
+  totalReplaced: number,
+  totalFailed: number
+) {
+  const workspaceFolders = vscode.workspace.workspaceFolders;
+  if (!workspaceFolders || workspaceFolders.length === 0) return;
+
+  const reportPath = path.join(workspaceFolders[0].uri.fsPath, ".no-logs-report.md");
+  const timestamp = new Date().toLocaleString();
+
+  let report = `# 🧹 No-Logs Cleanup Report\n\n`;
+  report += `**Date:** ${timestamp}\n\n`;
+  report += `## Summary\n\n`;
+  report += `- **Files Modified:** ${results.length}\n`;
+  report += `- **Total Removals:** ${totalRemoved}\n`;
+  report += `- **Total Replacements:** ${totalReplaced}\n`;
+  if (totalFailed > 0) {
+    report += `- **Failed:** ${totalFailed}\n`;
+  }
+  report += `\n---\n\n`;
+
+  report += `## Changes by File\n\n`;
+
+  for (const result of results) {
+    report += `### 📄 ${result.relativePath}\n\n`;
+    
+    for (const removal of result.removals) {
+      report += `**Line ${removal.line}** _(${removal.context})_\n\n`;
+      report += `\`\`\`diff\n`;
+      report += `- ${removal.originalCode}\n`;
+      if (removal.action === "replaced" && removal.replacement) {
+        report += `+ ${removal.replacement}\n`;
+      }
+      report += `\`\`\`\n\n`;
+    }
+  }
+
+  report += `---\n\n`;
+  report += `> Generated by No-Logs VSCode Extension\n`;
+  report += `> You can rollback this cleanup using: **No Logs: Rollback Last Cleanup**\n`;
+
+  try {
+    await fs.promises.writeFile(reportPath, report, "utf-8");
+    console.log(`Report generated at: ${reportPath}`);
+  } catch (error) {
+    console.error("Error generating report:", error);
+  }
+}
+
+async function openReportFile() {
+  const workspaceFolders = vscode.workspace.workspaceFolders;
+  if (!workspaceFolders) return;
+
+  const reportPath = path.join(workspaceFolders[0].uri.fsPath, ".no-logs-report.md");
+  
+  try {
+    const doc = await vscode.workspace.openTextDocument(reportPath);
+    await vscode.window.showTextDocument(doc, { preview: false });
+  } catch (error) {
+    console.error("Error opening report:", error);
   }
 }
 
@@ -351,14 +587,11 @@ function calculateSmartRemoval(
   const trimmedBefore = before.trim();
   const trimmedAfter = after.trim();
 
-  // Get extended context for better detection
   const extendedBefore = getExtendedContext(doc, start, 100, 'before');
   const extendedAfter = getExtendedContext(doc, end, 50, 'after');
 
-  // PATTERN 1: Arrow function without braces: => console.log(...)
-  // Must check there's no { after =>
+  // Arrow function without braces
   if (/=>\s*$/.test(trimmedBefore) && !/^\s*\{/.test(after)) {
-    // Preserve semicolon or comma if present
     const trailingPunctMatch = trimmedAfter.match(/^([;,])/);
     const trailing = trailingPunctMatch ? trailingPunctMatch[1] : '';
     return {
@@ -369,7 +602,7 @@ function calculateSmartRemoval(
     };
   }
 
-  // PATTERN 2: Ternary consequent: ? console.log(...)
+  // Ternary consequent
   if (/\?\s*$/.test(trimmedBefore)) {
     return {
       range: new vscode.Range(start, end),
@@ -379,12 +612,9 @@ function calculateSmartRemoval(
     };
   }
 
-  // PATTERN 3: Ternary alternate: : console.log(...)
-  // Check it's actually a ternary, not object property
+  // Ternary alternate
   if (/:\s*$/.test(trimmedBefore)) {
-    // Look back for ? to confirm it's a ternary
     const hasQuestionMark = extendedBefore.includes('?');
-    // Check it's not an object literal by looking for opening brace
     const lastBraceIndex = extendedBefore.lastIndexOf('{');
     const lastQuestionIndex = extendedBefore.lastIndexOf('?');
     
@@ -398,9 +628,8 @@ function calculateSmartRemoval(
     }
   }
 
-  // PATTERN 4: Return statement: return console.log(...)
+  // Return statement
   if (/\breturn\s+$/.test(before)) {
-    // Check if there's more after (like || or &&)
     if (/^\s*(\|\||&&)/.test(after)) {
       return {
         range: new vscode.Range(start, end),
@@ -417,7 +646,7 @@ function calculateSmartRemoval(
     };
   }
 
-  // PATTERN 5: Logical OR: || console.log(...)
+  // Logical OR
   if (/\|\|\s*$/.test(trimmedBefore)) {
     return {
       range: new vscode.Range(start, end),
@@ -427,7 +656,7 @@ function calculateSmartRemoval(
     };
   }
 
-  // PATTERN 6: Logical AND: && console.log(...)
+  // Logical AND
   if (/&&\s*$/.test(trimmedBefore)) {
     return {
       range: new vscode.Range(start, end),
@@ -437,9 +666,8 @@ function calculateSmartRemoval(
     };
   }
 
-  // PATTERN 7: Comma operator - first position: (console.log(...), something)
+  // Comma operator - first position
   if (/\(\s*$/.test(trimmedBefore) && /^\s*,/.test(trimmedAfter)) {
-    // Remove console.log and the trailing comma
     const commaMatch = after.match(/^\s*,\s*/);
     if (commaMatch) {
       const endPos = doc.positionAt(occ.endIndex + commaMatch[0].length);
@@ -452,9 +680,8 @@ function calculateSmartRemoval(
     }
   }
 
-  // PATTERN 8: Comma operator - last position: (something, console.log(...))
+  // Comma operator - last position
   if (/,\s*$/.test(trimmedBefore) && /^\s*\)/.test(trimmedAfter)) {
-    // Remove the preceding comma and console.log
     const commaMatch = before.match(/,\s*$/);
     if (commaMatch) {
       const startPos = new vscode.Position(
@@ -470,7 +697,7 @@ function calculateSmartRemoval(
     }
   }
 
-  // PATTERN 9: JSX expression: {console.log(...)}
+  // JSX expression
   if (/\{\s*$/.test(trimmedBefore) && /^\s*\}/.test(trimmedAfter)) {
     return {
       range: new vscode.Range(start, end),
@@ -480,7 +707,7 @@ function calculateSmartRemoval(
     };
   }
 
-  // PATTERN 10: Function call argument: func(console.log(...))
+  // Function call argument
   if (/\w+\s*\(\s*$/.test(trimmedBefore) && /^\s*\)/.test(trimmedAfter)) {
     return {
       range: new vscode.Range(start, end),
@@ -490,9 +717,9 @@ function calculateSmartRemoval(
     };
   }
 
-  // Safe removal cases - original logic
+  // Safe removal cases
 
-  // Case 1: Whole line only console.log
+  // Whole line only console.log
   if (/^\s*$/.test(before) && /^\s*$/.test(after)) {
     return {
       range: line.rangeIncludingLineBreak,
@@ -502,7 +729,7 @@ function calculateSmartRemoval(
     };
   }
 
-  // Case 2: Console at start of line with optional semicolon
+  // Console at start of line
   if (/^\s*$/.test(before)) {
     return {
       range: new vscode.Range(line.range.start, end),
@@ -512,7 +739,7 @@ function calculateSmartRemoval(
     };
   }
 
-  // Case 3: Console at end of line
+  // Console at end of 
   if (/^\s*;?\s*$/.test(after)) {
     return {
       range: new vscode.Range(start, line.rangeIncludingLineBreak.end),
@@ -522,7 +749,7 @@ function calculateSmartRemoval(
     };
   }
 
-  // Default: just remove the statement
+  // Default removal
   return {
     range: new vscode.Range(start, end),
     replacement: undefined,
@@ -549,4 +776,4 @@ function getExtendedContext(
     const endPos = doc.positionAt(endOffset);
     return doc.getText(new vscode.Range(pos, endPos));
   }
-}
+}  

@@ -3,9 +3,18 @@ export interface TextOccurrence {
   endIndex: number;
   startLine: number;
   preview: string;
-  method: string; 
+  method: string;
 }
+
 export interface FileLogOccurrences {
   filePath: string;
   occurrences: TextOccurrence[];
+}
+
+export interface BackupData {
+  timestamp: string;
+  files: Array<{
+    filePath: string;
+    originalContent: string;
+  }>;
 }
